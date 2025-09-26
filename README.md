@@ -1,0 +1,3 @@
+# Scout
+
+Initial Project README
