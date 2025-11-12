@@ -3,6 +3,8 @@ import torch
 import numpy as np
 from threading import Thread, Lock
 from ultralytics import YOLO
+from collections import deque
+import time
 
 # List of models that can be used are given below
 """
@@ -11,6 +13,7 @@ from ultralytics import YOLO
 'DPT_SwinV2_L_384', 'DPT_SwinV2_T_256', 'DPT_Swin_L_384', 'MiDaS', 'MiDaS_small', 
 'MidasNet', 'MidasNet_small', 'transforms']
 """
+## Setup of Models
 
 threshold = 0.5 # Defines what threshold score is required for an item to be recognized
 model_type = "DPT_Hybrid"
@@ -26,6 +29,10 @@ midas.eval()
 
 midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
 transform = midas_transforms.dpt_transform
+
+## Setup of Queue
+
+recentNames = deque(maxlen=10)
 
 # GStreamer pipeline for receiving raw H.264 over TCP
 pipeline = (
@@ -43,6 +50,7 @@ if not cap.isOpened():
 latestFrame = None      # latest camera frame
 latestDepth = None      # latest depth map
 latestYOLO  = None     # latest detection frame
+lastClosestObject = None
 frameLock = Lock()      # to prevent race conditions
 
 def capture_thread():
@@ -92,31 +100,61 @@ def depth_thread():
             latestDepth = depth_color
 
 def detection_thread():
-    global latestFrame, latestYOLO, threshold
+    global latestFrame, latestYOLO, latestDepth, threshold
 
     while True:
-        if latestFrame is not None:
+        if latestFrame is not None and latestDepth is not None:
             with frameLock:
                 frame_copy = latestFrame.copy()
+                depthCopy = cv2.cvtColor(latestDepth.copy(), cv2.COLOR_BGR2GRAY)
+
 
             results = yolo_model.predict(
                 source=frame_copy,
                 device=device,
                 imgsz=960,      # larger input for better detection
                 conf=0.25,      # lower confidence threshold
-                half=True       # FP16 for speed
+                half=True,       # FP16 for speed
+                verbose=False
             )
+
+            closestName = None
+            closestDepthScore = 0
+
+            # elapsedTime = time.perf_counter() - startTime
 
             result_frame = frame_copy.copy()
             for result in results:
                 for box in result.boxes.data.tolist():
                     x1, y1, x2, y2, score, class_id = box
                     if score > threshold:
-                        cv2.rectangle(result_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
-                        cv2.putText(result_frame, result.names[int(class_id)].upper(),
+                        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                        cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                        name = result.names[int(class_id)].upper()
+                        cv2.putText(result_frame, "{} {}".format(name, score),
                                     (int(x1), int(y1-10)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+                        
+                        
+                        depthBox = depthCopy[y1:y2, x1:x2]
+                        if (depthCopy.size > 0):
+                            meanDepthScore = np.mean(depthBox)
 
+                            if meanDepthScore > closestDepthScore:
+                                closestDepthScore = meanDepthScore
+                                closestName = name
+                        
+            
+            
+            recentNames.appendleft(closestName)
+
+            if closestName is not None:
+                print()
+                print(recentNames)
+                print(f"Closest Object: {closestName} with depth score {closestDepthScore:.2f}")
+                
+        
+                            
             with frameLock:
                 latestYOLO = result_frame.copy()
 
@@ -129,6 +167,8 @@ t1.start()
 t2.start()
 t3.start()
 
+# startTime = time.perf_counter()
+
 while True:
     displayFrame = None
     displayDepth = None
@@ -139,6 +179,7 @@ while True:
             displayFrame = latestFrame.copy()
         if latestDepth is not None:
             displayDepth = latestDepth.copy()
+            # depthGray = cv2.cvtColor(displayDepth, cv2.COLOR_BGR2GRAY)
         if latestYOLO is not None:
             displayYOLO = latestYOLO.copy()
 
@@ -146,6 +187,7 @@ while True:
         cv2.imshow("Original", displayFrame)
     if displayDepth is not None:
         cv2.imshow("Depth", displayDepth)
+        #cv2.imshow("Depth Grayscale", depthGray)
     if displayYOLO is not None:
         cv2.imshow("YOLO View", displayYOLO)
 
