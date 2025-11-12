@@ -5,6 +5,7 @@ from threading import Thread, Lock
 from ultralytics import YOLO
 from collections import deque
 import time
+import socket
 
 # List of models that can be used are given below
 """
@@ -34,6 +35,8 @@ transform = midas_transforms.dpt_transform
 
 recentNames = deque(maxlen=10)
 
+## Setup of Video TCP Server
+
 # GStreamer pipeline for receiving raw H.264 over TCP
 pipeline = (
     'tcpclientsrc host=192.168.1.85 port=10001 ! '
@@ -46,13 +49,33 @@ if not cap.isOpened():
     print("Failed to open stream")
     exit()
 
-# Shared variables
+# Shared variables between threads
+
 latestFrame = None      # latest camera frame
 latestDepth = None      # latest depth map
 latestYOLO  = None     # latest detection frame
-lastClosestObject = None
-frameLock = Lock()      # to prevent race conditions
+lastClosestName = None
 
+frameLock = Lock()
+name_lock = Lock()
+
+## Setup of Object Name TCP Server
+
+name_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+name_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+name_sock.connect("192.168.1.85", 10002)
+
+# Sends the name of the closest object detected to the Raspberry Pi via the name_sock
+# TCP socket
+def send_closest_item(name):
+    global name_sock
+    try:
+        with name_lock:
+            name_sock.sendall((name + "\n").encode())
+    except Exception as e:
+        print(f"Failed to send {name}: {e}")
+
+# Thread used to capture frames from the GStreamer TCP socket
 def capture_thread():
     global latestFrame
 
@@ -64,7 +87,7 @@ def capture_thread():
         with frameLock:
             latestFrame = frame.copy()
 
-
+# Thread used to run MiDaS analysis to determine distance of object from camera
 def depth_thread():
     global latestFrame, latestDepth
 
@@ -99,6 +122,7 @@ def depth_thread():
             depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
             latestDepth = depth_color
 
+# Thread used to run 
 def detection_thread():
     global latestFrame, latestYOLO, latestDepth, threshold
 
@@ -135,7 +159,6 @@ def detection_thread():
                                     (int(x1), int(y1-10)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
                         
-                        
                         depthBox = depthCopy[y1:y2, x1:x2]
                         if (depthCopy.size > 0):
                             meanDepthScore = np.mean(depthBox)
@@ -144,17 +167,15 @@ def detection_thread():
                                 closestDepthScore = meanDepthScore
                                 closestName = name
                         
-            
-            
             recentNames.appendleft(closestName)
 
             if closestName is not None:
-                print()
-                print(recentNames)
                 print(f"Closest Object: {closestName} with depth score {closestDepthScore:.2f}")
+
+                if (lastClosestName != closestName):
+                    send_closest_item(closestName)
+                    lastClosestName = closestName
                 
-        
-                            
             with frameLock:
                 latestYOLO = result_frame.copy()
 
